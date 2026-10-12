@@ -1,0 +1,197 @@
+
+name: Build Piso-WiFi OS for Orange Pi One
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build-pisowifi-image.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout Piso-WiFi source
+        uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/share/dotnet
+          df -h
+
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git curl wget rsync \
+            p7zip-full qemu-user-static \
+            binfmt-support
+
+      - name: Clone Armbian build framework
+        run: |
+          git clone --depth=1 \
+            https://github.com/armbian/build.git \
+            armbian-build
+
+      - name: Prepare Piso-WiFi application
+        run: |
+          set -eu
+
+          test -f main.py
+          test -f requirements.txt
+          test -d piso_wifi
+
+          mkdir -p \
+            armbian-build/userpatches/overlay/opt/pisowifi
+
+          rsync -a \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='.env' \
+            --exclude='.venv/' \
+            --exclude='venv/' \
+            --exclude='__pycache__/' \
+            --exclude='*.pyc' \
+            --exclude='*.db' \
+            --exclude='*.sqlite*' \
+            --exclude='node_modules/' \
+            ./ \
+            armbian-build/userpatches/overlay/opt/pisowifi/
+
+      - name: Configure Armbian image
+        run: |
+          cat > armbian-build/userpatches/config-pisowifi.conf <<'EOF'
+          BOARD="orangepione"
+          BRANCH="current"
+          RELEASE="bookworm"
+          BUILD_MINIMAL="yes"
+          BUILD_DESKTOP="no"
+          KERNEL_ONLY="no"
+          KERNEL_CONFIGURE="no"
+          COMPRESS_OUTPUTIMAGE="yes"
+          EOF
+
+      - name: Customize target OS
+        run: |
+          cat > armbian-build/userpatches/customize-image.sh <<'SCRIPT'
+          #!/bin/bash
+          set -e
+          export DEBIAN_FRONTEND=noninteractive
+
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            python3 python3-venv python3-pip \
+            python3-dev build-essential pkg-config \
+            libnl-3-dev libnl-genl-3-dev \
+            libssl-dev libxtables-dev \
+            hostapd dnsmasq \
+            iptables nftables iproute2 \
+            iw wireless-tools rfkill \
+            sqlite3 curl ca-certificates openssl
+
+          mkdir -p /opt/pisowifi
+          cp -a /tmp/overlay/opt/pisowifi/. \
+            /opt/pisowifi/
+
+          cd /opt/pisowifi
+
+          python3 -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install --no-cache-dir \
+            -r requirements.txt
+
+          mkdir -p config logs
+
+          if [ -f .env.example ]; then
+            cp .env.example .env
+          fi
+
+          if [ -f .env ]; then
+            sed -i \
+              's/^FLASK_ENV=.*/FLASK_ENV=production/' .env
+            sed -i \
+              's/^FLASK_DEBUG=.*/FLASK_DEBUG=False/' .env
+            sed -i \
+              's/^SETUP_COMPLETED=.*/SETUP_COMPLETED=false/' .env
+            sed -i \
+              's/^SECRET_KEY=.*/SECRET_KEY=/' .env
+            sed -i \
+              "s|^SECRET_KEY=.*|SECRET_KEY=$(openssl rand -hex 32)|" \
+              .env
+          fi
+
+          cat > /etc/systemd/system/pisowifi.service <<'EOF'
+          [Unit]
+          Description=Piso-WiFi Application
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User=root
+          WorkingDirectory=/opt/pisowifi
+          ExecStart=/opt/pisowifi/.venv/bin/python /opt/pisowifi/main.py
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          systemctl enable pisowifi.service
+
+          cat > /etc/pisowifi-build-info <<'EOF'
+          Orange Pi One Piso-WiFi image
+          Base OS: Armbian minimal
+          Application: /opt/pisowifi
+          Service: pisowifi.service
+          First-run network setup and hardware testing required.
+          EOF
+
+          apt-get clean
+          rm -rf /var/lib/apt/lists/*
+          SCRIPT
+
+          chmod +x \
+            armbian-build/userpatches/customize-image.sh
+
+      - name: Build Orange Pi One image
+        working-directory: armbian-build
+        run: |
+          set -o pipefail
+          ./compile.sh pisowifi \
+            2>&1 | tee ../pisowifi-build.log
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pisowifi-build-log
+          path: |
+            pisowifi-build.log
+            armbian-build/output/logs/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload flashable image
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pisowifi-orangepi-one-image
+          path: |
+            armbian-build/output/images/*.img
+            armbian-build/output/images/*.img.xz
+            armbian-build/output/images/*.sha
+            armbian-build/output/images/*.sha256
+          if-no-files-found: error
+          retention-days: 14
+          
