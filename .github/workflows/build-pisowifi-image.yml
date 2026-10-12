@@ -1,13 +1,11 @@
 
-name: Build Piso-WiFi OS for Orange Pi One
+name: Build Orange-WiFi for Orange Pi One
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
     paths:
-      - ".github/workflows/build-pisowifi-image.yml"
+      - ".github/workflows/build-orange-wifi.yml"
 
 permissions:
   contents: read
@@ -18,7 +16,7 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Checkout Piso-WiFi source
+      - name: Checkout Orange-WiFi source
         uses: actions/checkout@v4
 
       - name: Free runner disk space
@@ -34,45 +32,80 @@ jobs:
           sudo apt-get install -y \
             git curl wget rsync \
             p7zip-full qemu-user-static \
-            binfmt-support
+            binfmt-support ca-certificates
 
-      - name: Clone Armbian build framework
+          docker --version
+          git --version
+
+      - name: Download Armbian build framework
         run: |
+          set -euxo pipefail
+
           git clone --depth=1 \
             https://github.com/armbian/build.git \
             armbian-build
 
-      - name: Prepare Piso-WiFi application
+          test -f armbian-build/compile.sh
+
+          echo "=== Armbian version ==="
+          git -C armbian-build log -1 --oneline
+
+          echo "=== Orange Pi One board configuration ==="
+          find armbian-build/config \
+            -type f -iname '*orangepione*' -print
+
+      - name: Prepare clean application overlay
         run: |
-          set -eu
+          set -euxo pipefail
 
-          test -f main.py
-          test -f requirements.txt
-          test -d piso_wifi
+          OVERLAY="armbian-build/userpatches/overlay"
+          APP="$OVERLAY/home/pi/orange-wifi"
 
-          mkdir -p \
-            armbian-build/userpatches/overlay/opt/pisowifi
+          mkdir -p "$APP"
 
           rsync -a \
             --exclude='.git/' \
             --exclude='.github/' \
-            --exclude='.env' \
+            --exclude='armbian-build/' \
+            --exclude='output/' \
+            --exclude='release/' \
+            --exclude='*.img' \
+            --exclude='*.img.xz' \
+            --exclude='*.zip' \
+            --exclude='*.7z' \
+            --exclude='__pycache__/' \
             --exclude='.venv/' \
             --exclude='venv/' \
-            --exclude='__pycache__/' \
-            --exclude='*.pyc' \
-            --exclude='*.db' \
-            --exclude='*.sqlite*' \
             --exclude='node_modules/' \
-            ./ \
-            armbian-build/userpatches/overlay/opt/pisowifi/
+            --exclude='.pytest_cache/' \
+            ./ "$APP/"
 
-      - name: Configure Armbian image
+          echo "=== Application files ==="
+          find "$APP" -maxdepth 3 -type f | head -100
+
+          echo "=== Check for nested build directories ==="
+          if find "$APP" -type d \
+            -name armbian-build -print -quit | grep -q .; then
+            echo "ERROR: Nested armbian-build directory found."
+            exit 1
+          fi
+
+          if [ ! -f "$APP/start" ]; then
+            echo "ERROR: Application file 'start' is missing."
+            echo "Check the repository source and startup script name."
+            exit 1
+          fi
+
+      - name: Configure Orange Pi One image
         run: |
-          cat > armbian-build/userpatches/config-pisowifi.conf <<'EOF'
+          set -euxo pipefail
+
+          mkdir -p armbian-build/userpatches
+
+          cat > armbian-build/userpatches/config-orangewifi.conf <<'EOF'
           BOARD="orangepione"
           BRANCH="current"
-          RELEASE="bookworm"
+          RELEASE="trixie"
           BUILD_MINIMAL="yes"
           BUILD_DESKTOP="no"
           KERNEL_ONLY="no"
@@ -80,105 +113,158 @@ jobs:
           COMPRESS_OUTPUTIMAGE="yes"
           EOF
 
-      - name: Customize target OS
+          cat armbian-build/userpatches/config-orangewifi.conf
+
+      - name: Create image customization script
         run: |
+          set -euxo pipefail
+
           cat > armbian-build/userpatches/customize-image.sh <<'SCRIPT'
           #!/bin/bash
-          set -e
+          set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
 
+          echo "=== Installing Orange-WiFi packages ==="
+
           apt-get update
+
           apt-get install -y --no-install-recommends \
-            python3 python3-venv python3-pip \
-            python3-dev build-essential pkg-config \
-            libnl-3-dev libnl-genl-3-dev \
-            libssl-dev libxtables-dev \
-            hostapd dnsmasq \
-            iptables nftables iproute2 \
-            iw wireless-tools rfkill \
-            sqlite3 curl ca-certificates openssl
+            php-cli php-fpm php-curl php-sqlite3 \
+            php-xml php-mbstring php-gd \
+            lighttpd nginx \
+            hostapd dnsmasq nftables \
+            iptables iproute2 iw wireless-tools \
+            conntrack python3 python3-requests \
+            curl ca-certificates sqlite3 \
+            sudo g++ make pkg-config \
+            openbox xserver-xorg
 
-          mkdir -p /opt/pisowifi
-          cp -a /tmp/overlay/opt/pisowifi/. \
-            /opt/pisowifi/
+          echo "=== Copying application overlay ==="
 
-          cd /opt/pisowifi
+          SRC="/tmp/overlay/home/pi/orange-wifi"
+          DEST="/home/pi/orange-wifi"
 
-          python3 -m venv .venv
-          .venv/bin/pip install --upgrade pip
-          .venv/bin/pip install --no-cache-dir \
-            -r requirements.txt
-
-          mkdir -p config logs
-
-          if [ -f .env.example ]; then
-            cp .env.example .env
+          if [ ! -f "$SRC/start" ]; then
+            echo "ERROR: Missing application start script: $SRC/start"
+            exit 1
           fi
 
-          if [ -f .env ]; then
-            sed -i \
-              's/^FLASK_ENV=.*/FLASK_ENV=production/' .env
-            sed -i \
-              's/^FLASK_DEBUG=.*/FLASK_DEBUG=False/' .env
-            sed -i \
-              's/^SETUP_COMPLETED=.*/SETUP_COMPLETED=false/' .env
-            sed -i \
-              's/^SECRET_KEY=.*/SECRET_KEY=/' .env
-            sed -i \
-              "s|^SECRET_KEY=.*|SECRET_KEY=$(openssl rand -hex 32)|" \
-              .env
+          mkdir -p "$DEST"
+          cp -a "$SRC/." "$DEST/"
+          chmod +x "$DEST/start"
+          chown -R root:root "$DEST"
+
+          echo "=== Installing Orange-WiFi services ==="
+
+          if [ -f "$DEST/orange-wifi.service" ]; then
+            install -m 0644 \
+              "$DEST/orange-wifi.service" \
+              /etc/systemd/system/orange-wifi.service
+
+            mkdir -p \
+              /etc/systemd/system/multi-user.target.wants
+
+            ln -sfn \
+              /etc/systemd/system/orange-wifi.service \
+              /etc/systemd/system/multi-user.target.wants/orange-wifi.service
           fi
 
-          cat > /etc/systemd/system/pisowifi.service <<'EOF'
-          [Unit]
-          Description=Piso-WiFi Application
-          After=network-online.target
-          Wants=network-online.target
+          if [ -f "$DEST/silvasystems-kicker.service" ]; then
+            install -m 0644 \
+              "$DEST/silvasystems-kicker.service" \
+              /etc/systemd/system/silvasystems-kicker.service
 
-          [Service]
-          Type=simple
-          User=root
-          WorkingDirectory=/opt/pisowifi
-          ExecStart=/opt/pisowifi/.venv/bin/python /opt/pisowifi/main.py
-          Restart=on-failure
-          RestartSec=5
+            mkdir -p \
+              /etc/systemd/system/multi-user.target.wants
 
-          [Install]
-          WantedBy=multi-user.target
-          EOF
+            ln -sfn \
+              /etc/systemd/system/silvasystems-kicker.service \
+              /etc/systemd/system/multi-user.target.wants/silvasystems-kicker.service
+          fi
 
-          systemctl enable pisowifi.service
+          echo "=== Writing build information ==="
 
-          cat > /etc/pisowifi-build-info <<'EOF'
-          Orange Pi One Piso-WiFi image
-          Base OS: Armbian minimal
-          Application: /opt/pisowifi
-          Service: pisowifi.service
-          First-run network setup and hardware testing required.
-          EOF
+          cat > /etc/orange-wifi-build-info <<'INFO'
+          Board: Orange Pi One
+          SoC: Allwinner H3
+          Base: Armbian minimal
+          Application: /home/pi/orange-wifi
+          Network services require hardware testing.
+          INFO
+
+          echo "=== Cleaning package cache ==="
 
           apt-get clean
           rm -rf /var/lib/apt/lists/*
+
+          echo "=== Image customization completed ==="
           SCRIPT
 
           chmod +x \
             armbian-build/userpatches/customize-image.sh
 
+          bash -n \
+            armbian-build/userpatches/customize-image.sh
+
+      - name: Validate build configuration
+        working-directory: armbian-build
+        run: |
+          set -euxo pipefail
+
+          test -f compile.sh
+          test -f userpatches/config-orangewifi.conf
+          test -x userpatches/customize-image.sh
+          test -f userpatches/overlay/home/pi/orange-wifi/start
+
+          echo "=== Overlay directory ==="
+          find userpatches/overlay \
+            -maxdepth 4 -type d | head -100
+
+          echo "=== Nested Armbian directory check ==="
+          if find userpatches/overlay \
+            -type d -name armbian-build -print -quit |
+            grep -q .; then
+            echo "ERROR: Nested Armbian source detected."
+            exit 1
+          fi
+
+          echo "=== Validation passed ==="
+
       - name: Build Orange Pi One image
         working-directory: armbian-build
         run: |
           set -o pipefail
-          ./compile.sh pisowifi \
-            2>&1 | tee ../pisowifi-build.log
 
-      - name: Upload build log
+          ./compile.sh orangewifi \
+            2>&1 | tee ../orange-wifi-build.log
+
+      - name: Collect build diagnostics
+        if: always()
+        run: |
+          mkdir -p build-diagnostics
+
+          if [ -f orange-wifi-build.log ]; then
+            cp orange-wifi-build.log build-diagnostics/
+          fi
+
+          if [ -d armbian-build/output/logs ]; then
+            cp -a armbian-build/output/logs \
+              build-diagnostics/armbian-logs
+          fi
+
+          if [ -d armbian-build/output/images ]; then
+            find armbian-build/output/images \
+              -maxdepth 1 -type f \
+              -printf '%f (%s bytes)\n' \
+              > build-diagnostics/image-files.txt
+          fi
+
+      - name: Upload build logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pisowifi-build-log
-          path: |
-            pisowifi-build.log
-            armbian-build/output/logs/
+          name: orange-wifi-build-diagnostics
+          path: build-diagnostics/
           if-no-files-found: warn
           retention-days: 7
 
@@ -186,12 +272,12 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: pisowifi-orangepi-one-image
+          name: orange-wifi-orangepi-one-image
           path: |
             armbian-build/output/images/*.img
             armbian-build/output/images/*.img.xz
             armbian-build/output/images/*.sha
-            armbian-build/output/images/*.sha256
+            armbian-build/output/images/*.asc
           if-no-files-found: error
           retention-days: 14
           
